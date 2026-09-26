@@ -5,6 +5,7 @@ import { searchStatus, summarizeLibraryQuality } from "./reader-quality.js";
 import { readerMode } from "./reader-mode.js";
 import { pageBooks } from "./library-index.js";
 import { cleanReaderExplanation } from "./reader-notes.js";
+import { statusBadge as status } from "./status-badge.js";
 
 initThemes();
 
@@ -54,13 +55,6 @@ function originOf(value) {
 function matchingProviderPreset(settings) {
   return Object.entries(providerPresets).find(([, preset]) => preset.protocol === settings.protocol && preset.baseUrl === settings.baseUrl && preset.model === settings.model)?.[0] || "custom";
 }
-
-const labels = {
-  not_started: "未开始", extracting: "提取中", extracted: "已提取", translating: "翻译中",
-  drafted: "已初译", review: "待校订", approved: "已批准", failed: "失败",
-  queued: "排队中", completed: "已完成", paused: "已暂停", running: "运行中", cancelled: "已取消"
-  , suggested: "待确认", open: "待处理", resolved: "已解决"
-};
 
 async function request(url, options = {}) {
   const response = await fetch(url, options);
@@ -126,7 +120,6 @@ function progress(book) {
   return { total: book.chapters.length, approved, worked, percent: Math.round((approved / total) * 100) };
 }
 
-function status(value) { return `<span class="status ${value}">${labels[value] || value}</span>`; }
 function formatDate(value) { return value ? new Intl.DateTimeFormat("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(value)) : "—"; }
 function friendlyTaskError(task) {
   const raw = String(task.error || "");
@@ -552,7 +545,7 @@ async function renderSettings() {
     <section class="panel panel-pad lifecycle-panel"><div class="section-head settings-head"><div><h2>后台运行</h2><p>运行窗口可以最小化。关闭网页后，后台和翻译任务仍会继续。</p></div><button id="settings-shutdown">关闭后台</button></div></section>
     <details class="panel panel-pad storage-panel"><summary>本机数据与迁移</summary><div class="section-head settings-head"><div><h2>本机数据</h2><p>书籍、译文、导出和 API 配置保存在此目录。</p></div></div><code>${escapeHtml(capabilities.dataDirectory || "")}</code><p>如需迁移，请先停止工作台，再复制整个数据目录；启动前可设置 <code>TRANSLATION_LIBRARY_DATA_DIR</code> 指向新位置。</p></details>
     <form class="panel panel-pad settings-form" id="provider-form">
-      <div class="section-head settings-head"><div><h2>翻译引擎 <span class="default-badge">翻译与注释</span></h2><p>选择 API 或已安装的 CLI；翻译、精校与注释使用同一引擎。</p></div>${configured ? '<span class="status approved">已配置</span>' : '<span class="status review">待配置</span>'}</div>
+      <div class="section-head settings-head"><div><h2>翻译引擎 <span class="default-badge">翻译与注释</span></h2><p>选择 API 或已安装的 CLI；翻译、精校与注释使用同一引擎。</p></div>${status(configured ? "approved" : "open", configured ? "已配置" : "待配置")}</div>
       <label>引擎<select id="provider-backend">${["http", "codex", "opencode", "antigravity"].map((id) => `<option value="${id}" ${id === (providerSettings.backend || "http") ? "selected" : ""}>${{ http: "翻译 API", codex: "Codex CLI", opencode: "OpenCode CLI", antigravity: "Antigravity CLI" }[id]}</option>`).join("")}</select></label>
       <div id="cli-settings">
       <label id="opencode-mode-label">OpenCode 连接方式<select id="opencode-mode"><option value="cli" ${providerSettings.opencodeMode !== "server" ? "selected" : ""}>直接调用 CLI</option><option value="server" ${providerSettings.opencodeMode === "server" ? "selected" : ""} ${providerSettings.supportsOpenCodeServer ? "" : "disabled"}>连接本地服务 · 在桌面端查看会话</option></select></label>
@@ -580,12 +573,14 @@ async function renderSettings() {
       <label class="check-row"><input id="provider-no-auth" type="checkbox" ${providerSettings.noAuth ? "checked" : ""}/> 本机接口不需要 API 密钥</label>
       <label class="check-row"><input id="clear-provider-key" type="checkbox"/> 清除当前已保存的密钥</label>
       </details></div>
+      <label>每块原文目标字符数<input id="provider-block-chars" type="number" min="500" max="6000" step="1" required value="${providerSettings.translationBlockChars ?? 3000}" aria-describedby="provider-block-hint"/></label>
+      <p id="provider-block-hint">默认 3000，可设为 500–6000；CLI 较慢时可调小。初译与精校均适用，保留完整段落，超长单段或精校合并段可能超过此值。保存后用于新任务；继续未完成任务沿用原分块。</p>
       <div id="provider-key-notice" class="notice">密钥只发送给你填写的 API 地址，网页不会重新显示完整密钥。${protectionText} 配置位于本机 <code>secrets</code> 目录；不要把该目录发给他人。</div>
       <div id="provider-test-result" class="notice hidden"></div>
       <div class="dialog-actions"><button id="test-provider" type="button">测试并保存</button><button class="primary" type="submit">保存引擎配置</button></div>
     </form>
     <form class="panel panel-pad settings-form" id="search-settings-form">
-      <div class="section-head settings-head"><div><h2>联网搜索 API <span class="default-badge">可选 · 独立配置</span></h2><p>只用于少量高风险说法的 AI 查证；不影响初译、译名释义和读者注释。</p></div><span class="status ${searchSettings.hasApiKey ? "approved" : "review"}">${searchSettings.hasApiKey ? "已配置" : "可选"}</span></div>
+      <div class="section-head settings-head"><div><h2>联网搜索 API <span class="default-badge">可选 · 独立配置</span></h2><p>只用于少量高风险说法的 AI 查证；不影响初译、译名释义和读者注释。</p></div>${status(searchSettings.hasApiKey ? "approved" : "not_started", searchSettings.hasApiKey ? "已配置" : "可选")}</div>
       <p class="notice" id="search-usage-status">${escapeHtml(searchStatus(searchSettings))}。只有实际搜索请求计入额度；翻译模型用量单独计算。</p>
       <label>Brave Search API Key<input id="search-key" type="password" autocomplete="new-password" placeholder="${searchSettings.hasApiKey ? `已保存 ${escapeHtml(searchSettings.keyHint)}；留空则保持不变` : "填写独立的搜索 Key，不是翻译 API Key"}"/></label>
       <details class="settings-advanced"><summary>高级设置：搜索额度与自动核实数量</summary>
@@ -666,6 +661,7 @@ async function testSearchSettings() {
 }
 
 async function testProviderSettings() {
+  if (!document.querySelector("#provider-form").reportValidity()) return;
   const button = document.querySelector("#test-provider"); const resultBox = document.querySelector("#provider-test-result");
   button.disabled = true; button.textContent = "正在测试…"; resultBox.classList.add("hidden");
   try {
@@ -712,6 +708,7 @@ function cliConnectionPayload() {
 function providerPayload() {
   const payload = { providerName: document.querySelector("#provider-name").value, protocol: document.querySelector("#provider-protocol").value, baseUrl: document.querySelector("#provider-url").value, model: document.querySelector("#provider-model").value, maxOutputTokens: Number(document.querySelector("#provider-max-output").value), inputPrice: Number(document.querySelector("#provider-input-price").value), outputPrice: Number(document.querySelector("#provider-output-price").value), apiKey: document.querySelector("#provider-key").value, noAuth: document.querySelector("#provider-no-auth").checked, clearKey: document.querySelector("#clear-provider-key").checked };
   Object.assign(payload, cliConnectionPayload());
+  payload.translationBlockChars = Number(document.querySelector("#provider-block-chars").value);
   payload.reasoningEffort = document.querySelector("#provider-effort").value;
   if (payload.backend !== "http") { payload.model = document.querySelector("#provider-cli-model").value.trim(); payload.providerName = payload.backend === "opencode" && payload.opencodeMode === "server" ? "OpenCode 本地服务" : `${payload.backend} CLI`; }
   return payload;
