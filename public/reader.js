@@ -1,6 +1,9 @@
 import { themeButton } from "./themes.js";
 import { sourceLanguage } from "./languages.js";
 import { statusIcon, statusBadge } from "./status-badge.js";
+import { createCompare } from "./reader-compare.js";
+import { createAlign } from "./reader-align.js";
+import { IMAGE_PARAGRAPH } from "./illustrations.js";
 
 export function readingState(bookId) {
   try { return JSON.parse(localStorage.getItem(`reader:${bookId}`) || "{}"); } catch { return {}; }
@@ -11,6 +14,8 @@ export function rememberReading(bookId, patch) {
   return value;
 }
 const escape = (text = "") => String(text).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+
+const figureMarkup = (figures) => figures.map((f) => `<img class="reader-figure" src="${escape(f.url)}" alt="${escape(f.alt || "插图")}" loading="lazy" decoding="async"/>`).join("");
 
 export function readerSourceParagraphs(chapter) {
   if (Array.isArray(chapter.sourceParagraphs) && chapter.sourceParagraphs.length) return chapter.sourceParagraphs;
@@ -46,11 +51,14 @@ export function mountReader({ container, book, chapter, request, notify, navigat
       <button id="reader-mode" class="desktop-control">只看译文</button><button id="reader-side" class="mobile-control">看译文</button>${themeButton()}<button id="reader-options">阅读设置</button><button id="reader-tools">注释与工具</button>
     </header>
     <div class="reading-progress"><span id="reader-progress" role="status" aria-live="polite"></span><span class="spacer"></span><button id="reader-follow" hidden>回到翻译位置</button><button id="reader-pause" hidden>暂停</button><button id="reader-cancel" hidden>取消</button><button id="reader-retry" hidden>从未完成块继续</button></div>
+    <div id="version-strip" class="version-strip" hidden></div>
+    <div id="alignment-notice" class="reading-notice"></div>
     <div class="parallel-pages">
       <section class="reading-page original-page" aria-label="原文"><div class="reading-page-head"><strong>原文</strong><small>${visibleSource.length} 段 · ${sourceLang}</small></div><div id="source-scroll" class="reading-scroll" lang="${sourceLang}" tabindex="0">${visibleSource.map((p, i) => `<p ${p.id ? `data-ids="${escape(p.id)}"` : ""} tabindex="0"><span class="paragraph-number" aria-hidden="true">${i + 1}</span>${escape(p.text)}</p>`).join("") || '<p>原文尚未提取，请返回目录整理章节。</p>'}</div></section>
       <div id="reader-divider" class="reader-divider desktop-control" role="separator" tabindex="0" aria-label="调整原译栏宽" aria-orientation="vertical" aria-valuemin="30" aria-valuemax="70" aria-valuenow="${prefs.ratio}"></div>
       <section class="reading-page translated-page" aria-label="中文译文"><div class="reading-page-head"><strong>中文译文</strong><div><button class="primary" id="translate-range">${chapter.translation ? "重新翻译" : "翻译本章"}</button><button id="edit-translation">${chapter.translation ? "编辑译文" : "手工写入译文"}</button><button id="approve">${statusIcon("approved")}<span id="approve-label">标记定稿</span></button><button id="cancel-edit" hidden>取消编辑</button><button id="save-draft" hidden>保存修改</button></div></div>
-        <div id="translation-scroll" class="reading-scroll" lang="zh-CN" tabindex="0"><div id="alignment-notice" class="reading-notice"></div><div id="translation-read"></div></div>
+        <div id="translation-scroll" class="reading-scroll" lang="zh-CN" tabindex="0"><div id="translation-read"></div><div id="compare-view" class="compare-view" hidden></div></div>
+        <div id="compose-bar" class="compose-bar" hidden></div>
         <textarea id="translation" class="reading-editor" lang="zh-CN" aria-label="编辑中文译文" hidden>${escape(chapter.translation || "")}</textarea>
       </section>
     </div>
@@ -71,6 +79,13 @@ export function mountReader({ container, book, chapter, request, notify, navigat
   </section>`;
   const $ = (selector) => container.querySelector(selector);
   const room = $(".reading-room"), sourcePane = $("#source-scroll"), translatedPane = $("#translation-scroll"), read = $("#translation-read"), editor = $("#translation");
+  // Illustrations: paragraph id -> image, filled in once the chapter's images are known.
+  const figures = new Map();
+  const figuresFor = (ids) => ids.length && ids.every((id) => figures.has(id)) ? ids.map((id) => figures.get(id)) : null;
+  const compare = createCompare({ figure: (id) => figures.get(id) || null, room, strip: $("#version-strip"), view: $("#compare-view"), bar: $("#compose-bar"), read, book, request, notify, configure, isEditing: () => editing, sourceLang,
+    translate: (profileId, range) => startTranslation("draft", range, false, profileId),
+    onComposed: async () => { try { update(await request(`/api/books/${book.id}/chapters/${chapter.id}`)); } catch (e) { notify(e.message); } } });
+  compare.onViewChange = () => { const anchor = capture(translatedPane); update(current); if (anchor) locate(translatedPane, anchor); };
   const syncApproval = () => {
     $("#approve").hidden = editing;
     $("#approve").disabled = approving || !current.translation?.trim() || current.status === "approved";
@@ -82,7 +97,9 @@ export function mountReader({ container, book, chapter, request, notify, navigat
   const applyPrefs = () => { room.dataset.mode = prefs.mode; room.dataset.mobileSide = mobileSide; room.dataset.theme = prefs.theme; room.style.setProperty("--reader-size", `${prefs.fontSize}px`); room.style.setProperty("--source-width", `${prefs.ratio}fr`); room.style.setProperty("--translation-width", `${100 - prefs.ratio}fr`); $("#reader-mode").textContent = prefs.mode === "parallel" ? "只看译文" : "原译对照"; $("#reader-side").textContent = mobileSide === "source" ? "看译文" : "看原文"; };
   const activePane = () => narrow.matches ? (mobileSide === "source" ? sourcePane : translatedPane) : prefs.mode === "translation" ? translatedPane : lastPane;
   const idsOf = (node) => (node?.dataset.ids || "").split(" ");
-  const findNode = (pane, id) => [...pane.querySelectorAll("[data-ids]")].find((node) => idsOf(node).includes(id));
+  // Comparison hides the normal paragraphs instead of removing them; only visible nodes are anchors.
+  const visibleNodes = (pane) => [...pane.querySelectorAll("[data-ids]")].filter((node) => !node.closest("[hidden]"));
+  const findNode = (pane, id) => visibleNodes(pane).find((node) => idsOf(node).includes(id));
   const highlightParagraph = (paragraphId) => {
     container.querySelectorAll(".paragraph-active").forEach((p) => p.classList.remove("paragraph-active"));
     for (const pane of [sourcePane, translatedPane]) findNode(pane, paragraphId)?.classList.add("paragraph-active");
@@ -103,7 +120,7 @@ export function mountReader({ container, book, chapter, request, notify, navigat
   };
   const capture = (pane) => {
     const top = pane.getBoundingClientRect().top;
-    const nodes = [...pane.querySelectorAll("[data-ids]")];
+    const nodes = visibleNodes(pane);
     const node = nodes.find((p) => p.getBoundingClientRect().bottom > top + 8) || nodes.at(-1);
     if (!node) return null;
     const rect = node.getBoundingClientRect(); const ids = idsOf(node);
@@ -149,9 +166,25 @@ export function mountReader({ container, book, chapter, request, notify, navigat
       const paragraphId = idsOf(node)[0];
       highlightParagraph(paragraphId);
       revealCounterpart(pane === sourcePane ? translatedPane : sourcePane, paragraphId);
+      compare.paragraphClicked(paragraphId);
       clearTimeout(anchorTimer); saveAnchor();
     });
   }
+  const align = createAlign({ room, sourcePane, translatedPane, read, findNode, idsOf, request, book, chapter, notify, isActive: () => !editing && !compare.isComparing() && current.alignmentStatus !== "legacy" });
+  // Fetch the chapter's illustrations and put them where extraction left "[图片]" placeholders, on both sides.
+  (async () => {
+    if (!["EPUB", "AZW3"].includes(String(book.format || "").toUpperCase()) || legacyServer) return;
+    let found; try { found = await request(`/api/books/${book.id}/chapters/${chapter.id}/images`); } catch { return; }
+    if (disposed || !found?.images?.length) return;
+    const holders = visibleSource.filter((p) => p.id && IMAGE_PARAGRAPH.test(String(p.text).trim()));
+    holders.forEach((p, i) => { const image = found.images[i]; if (image) figures.set(p.id, image); });
+    for (const [id, image] of figures) {
+      const node = sourcePane.querySelector(`p[data-ids="${CSS.escape(id)}"]`); if (!node) continue;
+      const number = node.querySelector(".paragraph-number");
+      node.innerHTML = figureMarkup([image]); if (number) node.prepend(number); node.classList.add("paragraph-figure");
+    }
+    if (figures.size && !editing) update(current);
+  })();
   const selectionChanged = () => { if (!getSelection().isCollapsed && container.contains(getSelection().anchorNode)) stopFollow(); else if (deferred && !editing) { const next = deferred; deferred = null; update(next); } };
   document.addEventListener("selectionchange", selectionChanged);
   const openDialog = (id) => { stopFollow(); $(id).showModal(); };
@@ -194,7 +227,7 @@ export function mountReader({ container, book, chapter, request, notify, navigat
   divider.onkeydown = (event) => { if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return; event.preventDefault(); setRatio(event.key === "Home" ? 30 : event.key === "End" ? 70 : prefs.ratio + (event.key === "ArrowLeft" ? -2 : 2)); };
   $("#reader-theme").onchange = (e) => { remember({ theme: e.target.value }); applyPrefs(); };
   $("#reader-sync").onchange = (e) => remember({ sync: e.target.checked });
-  const startTranslation = async (mode = "draft", range = { type: "whole" }, retry = false) => { if (legacyServer) return notify("请先重启工作台并刷新页面，以启用新版翻译功能"); if (editing) return notify("请先保存或取消编辑"); await start(mode, range, retry); follow = true; $("#reader-follow").hidden = true; };
+  const startTranslation = async (mode = "draft", range = { type: "whole" }, retry = false, profileId) => { if (legacyServer) return notify("请先重启工作台并刷新页面，以启用新版翻译功能"); if (editing) return notify("请先保存或取消编辑"); await start(mode, range, retry, profileId); follow = true; $("#reader-follow").hidden = true; };
   $("#translate-range").onclick = () => startTranslation();
   $("#refine-translation").onclick = () => { $("#reader-drawer").close(); startTranslation("refine"); };
   $("#translate-selection").onclick = () => { const range = { type: $("#range-type").value, start: Number($("#range-start").value), end: Number($("#range-end").value) }; $("#reader-drawer").close(); startTranslation("draft", range); };
@@ -202,7 +235,7 @@ export function mountReader({ container, book, chapter, request, notify, navigat
   $("#reader-follow").onclick = () => { follow = true; jumpLatest(); $("#reader-follow").hidden = true; };
   $("#reader-engine").onclick = configure; $("#analyze-chapter").onclick = analyze; $("#reader-export").onclick = exportBook;
   $("#reader-shutdown").onclick = () => { $("#reader-drawer").close(); shutdown?.(); };
-  const setEditing = (value) => { editing = value; syncApproval(); stopFollow(); editor.hidden = !value; translatedPane.hidden = value; $("#edit-translation").hidden = value; $("#cancel-edit").hidden = !value; $("#save-draft").hidden = !value; if (value) { editor.value = current.translation || ""; mobileSide = "translation"; applyPrefs(); editor.focus(); } else if (deferred) { const next = deferred; deferred = null; update(next); } };
+  const setEditing = (value) => { editing = value; if (value) compare.reset(); syncApproval(); stopFollow(); editor.hidden = !value; translatedPane.hidden = value; $("#edit-translation").hidden = value; $("#cancel-edit").hidden = !value; $("#save-draft").hidden = !value; if (value) { editor.value = current.translation || ""; mobileSide = "translation"; applyPrefs(); editor.focus(); } else if (deferred) { const next = deferred; deferred = null; update(next); } else update(current); };
   $("#edit-translation").onclick = () => setEditing(true);
   $("#cancel-edit").onclick = () => { if (editor.value !== (current.translation || "") && !confirm("放弃未保存的修改？")) return; setEditing(false); };
   $("#save-draft").onclick = async () => { if (await save(editor.value, "review")) { setEditing(false); } };
@@ -218,7 +251,10 @@ export function mountReader({ container, book, chapter, request, notify, navigat
     for (const segment of segments) {
       const key = segment.sourceParagraphIds.join(" ") || "legacy"; let node = old.get(key);
       if (!node) { node = document.createElement("p"); node.dataset.key = key; node.tabIndex = 0; if (key !== "legacy") node.dataset.ids = key; }
-      old.delete(key); if (node.textContent !== segment.text) { node.textContent = segment.text; changed = true; }
+      old.delete(key);
+      const art = figuresFor(segment.sourceParagraphIds);
+      if (art) { const sig = art.map((f) => f.url).join(" "); if (node.dataset.figure !== sig) { node.innerHTML = figureMarkup(art); node.dataset.figure = sig; node.classList.add("paragraph-figure"); changed = true; } }
+      else if (node.textContent !== segment.text || node.dataset.figure) { node.textContent = segment.text; delete node.dataset.figure; node.classList.remove("paragraph-figure"); changed = true; }
       if (node.classList.contains("paragraph-pending") !== Boolean(segment.pending)) changed = true;
       node.classList.toggle("paragraph-pending", Boolean(segment.pending));
       if (node.previousElementSibling !== previous || node.parentNode !== read) { read.insertBefore(node, previous ? previous.nextSibling : read.firstChild); changed = true; }
@@ -246,11 +282,14 @@ export function mountReader({ container, book, chapter, request, notify, navigat
     const completed = (run?.blocks || []).filter((b) => b.status === "completed").flatMap((b) => b.segments);
     const preview = !next.translation && !run?.partial && completed.length;
     const mapped = preview ? completed : next.alignedSegments;
-    if (mapped) {
+    const viewedVersion = compare.sync(next);
+    if (viewedVersion) reconcile(viewedVersion);
+    else if (mapped) {
       const covered = new Set(mapped.flatMap((s) => s.sourceParagraphIds)); const byId = new Map(mapped.map((s) => [s.sourceParagraphIds[0], s]));
       reconcile(paragraphs.flatMap((p, i) => byId.has(p.id) ? [byId.get(p.id)] : covered.has(p.id) ? [] : [{ sourceParagraphIds: [p.id], text: `第 ${i + 1} 段 · 等待译文`, pending: true }]));
     } else if (next.translation) reconcile([{ sourceParagraphIds: [], text: next.translation }]);
     else reconcile(paragraphs.map((p, i) => ({ sourceParagraphIds: [p.id], text: `第 ${i + 1} 段 · 等待译文`, pending: true })));
+    compare.decorate();
     $("#alignment-notice").textContent = next.alignmentStatus === "legacy" ? "此版本保留章级对照，尚无可靠段落映射。重新初译可建立对齐，旧版会保留。" : next.translation && run && active ? "新译稿正在后台生成；当前版本保持可读。" : preview ? "已完成的段落已保存，余下内容继续翻译。" : "";
     $("#reader-usage").textContent = next.usage?.inputTokens == null ? "用量未知" : `输入 ${next.usage.inputTokens} / 输出 ${next.usage.outputTokens ?? "未知"} · ${next.lastModel || ""}`;
     $("#reader-quality").textContent = next.analysis ? `注释分析覆盖 ${next.analysis.analyzedCharacters}/${next.analysis.sourceCharacters} 字` : next.translation ? "尚未检查" : "尚未翻译";
@@ -281,5 +320,5 @@ export function mountReader({ container, book, chapter, request, notify, navigat
   requestAnimationFrame(() => { if (disposed) return; const anchor = prefs.anchor; locate(sourcePane, anchor); locate(translatedPane, anchor); });
   const onResize = () => { const anchor = prefs.anchor; applyPrefs(); locate(activePane(), anchor); };
   narrow.addEventListener("change", onResize);
-  return { update, isEditing: () => editing || segmentDrafts.size > 0, destroy: () => { saveAnchor(); disposed = true; clearTimeout(anchorTimer); clearTimeout(searchTimer); document.removeEventListener("selectionchange", selectionChanged); narrow.removeEventListener("change", onResize); window.removeEventListener("workbench-theme-beforechange", beforeThemeChange); window.removeEventListener("workbench-themechange", afterThemeChange); } };
+  return { update, isEditing: () => editing || segmentDrafts.size > 0, destroy: () => { saveAnchor(); disposed = true; align.destroy(); clearTimeout(anchorTimer); clearTimeout(searchTimer); document.removeEventListener("selectionchange", selectionChanged); narrow.removeEventListener("change", onResize); window.removeEventListener("workbench-theme-beforechange", beforeThemeChange); window.removeEventListener("workbench-themechange", afterThemeChange); } };
 }

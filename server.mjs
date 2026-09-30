@@ -1,6 +1,6 @@
 import { discoverCliModels, validateCliChoice } from "./lib/cli-models.mjs";
 import { probeCli } from "./lib/cli-provider.mjs";
-import { providerSnapshot } from "./lib/providers.mjs";
+import { providerSnapshot, listHttpModels } from "./lib/providers.mjs";
 import { OpenCodeServer, usesOpenCodeServer, discoverOpenCodeServerModels, probeOpenCodeServer, stopOpenCodeSessions } from "./lib/opencode-server.mjs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { sourceParagraphs, sourceFingerprint, revisionSegments, DEFAULT_TRANSLATION_BLOCK_CHARS, validateTranslationBlockChars } from "./lib/alignment.mjs";
@@ -11,10 +11,13 @@ import { chmod, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs
 import { basename, dirname, extname, join, normalize, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createEpub } from "./lib/epub.mjs";
-import { analyzeChapterEntities, checkControl, waitControl, extractDocument, identifyHighRisk, japaneseOcrPath, ocrStatus, readChapterText, testProviderConnection, translateChapter, writeTranslation } from "./lib/engine.mjs";
+import { BUILTIN_PROMPT_SET, PROMPT_VARIABLES, normalizePromptSet, promptSetFor } from "./lib/prompts.mjs";
+import { isIllustrationText } from "./public/illustrations.js";
+import { analyzeChapterEntities, checkControl, waitControl, extractDocument, identifyHighRisk, japaneseOcrPath, ocrStatus, readChapterText, testProviderConnection, alignSelection, bookImages, bookImagesDir, previewTranslationMessages, translateChapter, writeTranslation } from "./lib/engine.mjs";
 import { SOURCE_LANGUAGES, sourceLanguage } from "./public/languages.js";
 import { searchResearchSources, verifyIssue } from "./lib/research.mjs";
 import { createSearchBudget } from "./lib/search-budget.mjs";
+import { comparableVersions, partialVersions, composeRevision, engineKey, isVersionColor, VERSION_PALETTE } from "./public/compare-core.js";
 import { activeRevisionPath, preserveLegacyRevision, canAutoRevise, canAutoReviseFromEvidence, newRevisionId, preserveChapterRevisionState } from "./lib/revisions.mjs";
 import { dataRoot } from "./lib/data-paths.mjs";
 import { toolCandidates } from "./lib/tool-paths.mjs";
@@ -25,9 +28,11 @@ const PUBLIC = join(ROOT, "public");
 const DATA_ROOT = dataRoot({ root: ROOT });
 const DATA = join(DATA_ROOT, "data");
 const DATA_FILE = join(DATA, "library.json");
+const PROMPTS_FILE = join(DATA, "prompts.json");
 const SECRETS = join(DATA_ROOT, "secrets");
 const PROVIDER_FILE = join(SECRETS, "provider.json");
 const SEARCH_FILE = join(SECRETS, "search.json");
+const PROFILES_FILE = join(SECRETS, "engine-profiles.json");
 const SEARCH_CACHE_FILE = join(DATA, "search-cache.json");
 const EXPORTS = join(DATA_ROOT, "exports");
 const LIBRARY = join(DATA_ROOT, "library");
@@ -85,7 +90,11 @@ function secretOperation(mode, value) {
 }
 async function readProvider() {
   if (!existsSync(PROVIDER_FILE)) return { ...providerDefaults };
-  const stored = JSON.parse(await readFile(PROVIDER_FILE, "utf8"));
+  return decodeProvider(JSON.parse(await readFile(PROVIDER_FILE, "utf8")));
+}
+// Turns the on-disk form (keys still DPAPI-protected) into a usable provider. Shared by the active engine and saved profiles.
+async function decodeProvider(stored) {
+  stored = { ...stored };
   const apiKey = stored.apiKeyProtected ? await secretOperation("Unprotect", stored.apiKeyProtected) : (stored.apiKey || "");
   const opencodePassword = stored.opencodePasswordProtected ? await secretOperation("Unprotect", stored.opencodePasswordProtected) : (stored.opencodePassword || "");
   delete stored.opencodePasswordProtected; delete stored.opencodePassword;
@@ -128,6 +137,67 @@ async function saveSearchSettings(body) {
   searchDailyLimit = next.dailyLimit;
   return publicSearchSettings({ ...next, apiKey });
 }
+// Engine profiles keep whole provider files as stored on disk, so saved keys stay protected and never pass through the browser.
+async function readProfiles() {
+  if (!existsSync(PROFILES_FILE)) return [];
+  try { const value = JSON.parse(await readFile(PROFILES_FILE, "utf8")); return Array.isArray(value.profiles) ? value.profiles : []; } catch { return []; }
+}
+async function writeProfiles(profiles) {
+  const temp = `${PROFILES_FILE}.tmp`;
+  await writeFile(temp, `${JSON.stringify({ profiles }, null, 2)}\n`, "utf8"); await rename(temp, PROFILES_FILE); await chmod(PROFILES_FILE, 0o600).catch(() => {});
+}
+async function storedProvider() { return existsSync(PROVIDER_FILE) ? JSON.parse(await readFile(PROVIDER_FILE, "utf8")) : null; }
+function profileSummary(profile, activeKey) {
+  const s = profile.stored || {}; const key = engineKey(s);
+  let host = ""; try { host = s.baseUrl ? new URL(s.baseUrl).host : ""; } catch { /* keep blank */ }
+  return { id: profile.id, name: profile.name, color: profile.color, engineKey: key, active: key === activeKey, backend: s.backend || "http", model: s.model || "", providerName: s.providerName || "", host, reasoningEffort: s.reasoningEffort || "", inputPrice: Number(s.inputPrice) || 0, outputPrice: Number(s.outputPrice) || 0, translationBlockChars: s.translationBlockChars || 0, keyProtection: s.keyProtection || "none", createdAt: profile.createdAt, updatedAt: profile.updatedAt };
+}
+async function listProfiles() {
+  const current = await storedProvider(); const activeKey = current ? engineKey(current) : "";
+  return { profiles: (await readProfiles()).map((p) => profileSummary(p, activeKey)), palette: VERSION_PALETTE, activeKey };
+}
+function profileFields(body, existing = {}) {
+  const name = String(body.name ?? existing.name ?? "").trim().slice(0, 40);
+  if (!name) throw new Error("请给引擎档案起个名字");
+  const color = String(body.color ?? existing.color ?? "").toLowerCase();
+  if (!isVersionColor(color)) throw new Error("颜色无效，请从色板中选择");
+  return { name, color };
+}
+async function saveProfileFromCurrent(body) {
+  const current = await storedProvider();
+  if (!current || (!current.backend || current.backend === "http") && !(current.baseUrl && current.model)) throw new Error("请先在上方配置并保存一个翻译引擎，再存为档案");
+  const profiles = await readProfiles(); const now = new Date().toISOString();
+  const existing = body.id ? profiles.find((p) => p.id === body.id) : null;
+  if (body.id && !existing) throw new Error("引擎档案不存在");
+  const fields = profileFields(body, existing || {});
+  if (existing) Object.assign(existing, fields, { stored: current, updatedAt: now });
+  else profiles.push({ id: `profile-${Date.now()}-${Math.random().toString(16).slice(2, 7)}`, ...fields, stored: current, createdAt: now, updatedAt: now });
+  await writeProfiles(profiles); return listProfiles();
+}
+async function updateProfile(id, body) {
+  const profiles = await readProfiles(); const profile = profiles.find((p) => p.id === id); if (!profile) throw new Error("引擎档案不存在");
+  Object.assign(profile, profileFields(body, profile), { updatedAt: new Date().toISOString() }); await writeProfiles(profiles); return listProfiles();
+}
+async function deleteProfile(id) {
+  const profiles = await readProfiles(); const next = profiles.filter((p) => p.id !== id); if (next.length === profiles.length) throw new Error("引擎档案不存在");
+  await writeProfiles(next); return listProfiles();
+}
+async function activateProfile(id) {
+  const profile = (await readProfiles()).find((p) => p.id === id); if (!profile) throw new Error("引擎档案不存在");
+  const temp = `${PROVIDER_FILE}.tmp`;
+  await writeFile(temp, `${JSON.stringify(profile.stored, null, 2)}\n`, "utf8"); await rename(temp, PROVIDER_FILE); await chmod(PROVIDER_FILE, 0o600).catch(() => {});
+  return publicProvider(await readProvider());
+}
+// Provider for one translation: an explicit profile, or the active engine tagged with the profile it matches.
+async function providerForTranslation(profileId) {
+  const profiles = await readProfiles();
+  if (profileId) {
+    const profile = profiles.find((p) => p.id === profileId); if (!profile) throw new Error("所选引擎档案不存在，请在设置中检查");
+    return { provider: await decodeProvider(profile.stored), profile };
+  }
+  const provider = await readProvider(); const key = engineKey(provider);
+  return { provider, profile: profiles.find((p) => engineKey(p.stored || {}) === key) || null };
+}
 function publicProvider(settings) {
   const { apiKey, apiKeyProtected, opencodePassword, opencodePasswordProtected, ...safe } = settings;
   return { ...safe, hasApiKey: Boolean(apiKey), keyHint: apiKey ? `••••${apiKey.slice(-4)}` : "", hasOpenCodePassword: Boolean(opencodePassword), supportsOpenCodeServer: true };
@@ -139,6 +209,12 @@ function openCodeSettings(body, existing) {
   const sameServer = next.opencodeServerUrl === existing.opencodeServerUrl && next.opencodeUsername === existing.opencodeUsername;
   next.opencodePassword = body.clearOpenCodePassword ? "" : String(body.opencodePassword || "") || (sameServer ? existing.opencodePassword || "" : "");
   return next;
+}
+// Unsaved form values over the saved engine; the saved key is reused only for the same service origin.
+async function candidateProvider(body) {
+  const previous = await readProvider();
+  let sameOrigin = true; try { sameOrigin = !body.baseUrl || new URL(body.baseUrl).origin === new URL(previous.baseUrl).origin; } catch { sameOrigin = false; }
+  return { ...previous, ...body, ...openCodeSettings(body, previous), apiKey: body.clearKey ? "" : body.apiKey || (sameOrigin ? previous.apiKey : "") };
 }
 async function providerForRequest(body) {
   const existing = await readProvider();
@@ -152,7 +228,7 @@ async function saveProvider(body) {
   const backend = body.backend || existing.backend || "http";
   if (!["http", "codex", "opencode", "antigravity", "claude"].includes(backend)) throw new Error("不支持的翻译引擎");
   const protocol = String(body.protocol || existing.protocol);
-  if (!["openai-chat", "openai-responses"].includes(protocol)) throw new Error("不支持的接口协议");
+  if (!["openai-chat", "openai-responses", "gemini"].includes(protocol)) throw new Error("不支持的接口协议");
   const baseUrl = String(body.baseUrl ?? existing.baseUrl).trim().replace(/\/+$/, "");
   if (baseUrl) {
     const parsed = new URL(baseUrl);
@@ -171,7 +247,9 @@ async function saveProvider(body) {
     maxOutputTokens: Math.min(131072, Math.max(256, Number(body.maxOutputTokens || existing.maxOutputTokens || 8192))),
     inputPrice: Math.max(0, Number(body.inputPrice ?? existing.inputPrice ?? 0)),
     outputPrice: Math.max(0, Number(body.outputPrice ?? existing.outputPrice ?? 0)),
-    noAuth: Boolean(body.noAuth),
+    noAuth: Boolean(body.noAuth), stream: body.stream === undefined ? existing.stream !== false : Boolean(body.stream),
+    geminiRetries: Math.max(0, Math.min(5, Math.round(Number(body.geminiRetries ?? existing.geminiRetries ?? 2)) || 0)),
+    thinkingBudget: (() => { const v = body.thinkingBudget === undefined ? existing.thinkingBudget : body.thinkingBudget; if (v === "" || v == null) return ""; const n = Math.round(Number(v)); return Number.isFinite(n) && n >= 0 ? Math.min(n, 65536) : ""; })(),
     apiKey: incomingKey || (body.clearKey || providerChanged ? "" : (existing.apiKey || "")), updatedAt: new Date().toISOString()
   };
   if (backend !== "http") {
@@ -282,6 +360,30 @@ async function syncProjectMetadata(book) {
   await writeFile(path, `${JSON.stringify(project, null, 2)}\n`, "utf8");
 }
 const taskControls = new Map();
+// Live view of a running translation: what the model has thought and written for the current block, kept in
+// memory only (never in the library), trimmed to the latest part, and dropped a while after the task ends.
+const liveOutput = new Map();
+const LIVE_KEEP = { reasoning: 6000, text: 8000, log: 40 };
+function recordLive(taskId, update) {
+  const now = Date.now();
+  let live = liveOutput.get(taskId);
+  if (!live) { live = { taskId, startedAt: now, block: 0, blocks: 0, attempt: 1, phase: "waiting", blockStartedAt: now, firstByteAt: null, lastAt: now, reasoning: "", text: "", reasoningChars: 0, textChars: 0, events: 0, log: [] }; liveOutput.set(taskId, live); }
+  live.lastAt = now;
+  const note = (text) => { live.log.push({ at: new Date(now).toISOString(), note: text }); if (live.log.length > LIVE_KEEP.log) live.log.splice(0, live.log.length - LIVE_KEEP.log); };
+  if (update.type === "block") {
+    Object.assign(live, { block: update.block, blocks: update.blocks, attempt: update.attempt, model: update.model, phase: "waiting", blockStartedAt: now, firstByteAt: null, reasoning: "", text: "", reasoningChars: 0, textChars: 0 });
+    note(`开始第 ${update.block}/${update.blocks} 块（${update.paragraphs} 段，${update.chars} 字）${update.attempt > 1 ? ` · 第 ${update.attempt} 次尝试` : ""}`);
+  } else if (update.type === "reasoning" || update.type === "text") {
+    const key = update.type; live.firstByteAt ||= now; live.phase = key === "text" ? "writing" : live.phase === "writing" ? "writing" : "thinking";
+    live[key] = (live[key] + update.text).slice(-LIVE_KEEP[key]); live[`${key}Chars`] += update.text.length;
+  } else if (update.type === "status") note(update.note);
+  else if (update.type === "event") live.events++;
+}
+function finishLive(taskId, outcome) {
+  const live = liveOutput.get(taskId); if (!live) return;
+  live.phase = "done"; live.outcome = outcome; live.lastAt = Date.now();
+  setTimeout(() => { if (liveOutput.get(taskId) === live) liveOutput.delete(taskId); }, 10 * 60 * 1000).unref?.();
+}
 let taskQueue = Promise.resolve();
 let stopping = false, shutdownPromise, shutdownDeadline;
 // All library read/modify/write transactions share one lock, including different books.
@@ -299,22 +401,34 @@ async function updateTask(taskId, changes) {
     return null;
   });
 }
+function taskErrorDetail(error) {
+  const detail = error?.detail && typeof error.detail === "object" ? error.detail : {};
+  const clip = (value, n) => (typeof value === "string" ? value.slice(0, n) : value ?? undefined);
+  const out = { kind: detail.kind, status: detail.status, endpoint: detail.endpoint, backend: detail.backend, model: detail.model, reasoningEffort: detail.reasoningEffort, stage: detail.stage, streaming: detail.streaming, elapsedMs: detail.elapsedMs, cause: detail.cause, partialChars: detail.partialChars, response: clip(detail.response, 1500), stderr: clip(detail.stderr, 1500), result: clip(detail.result, 1500), finishReason: error?.finishReason, partialText: clip(error?.partialText, 400) };
+  return Object.fromEntries(Object.entries(out).filter(([, v]) => v !== undefined && v !== ""));
+}
 async function startTask(bookId, type, detail, runner, metadata = {}) {
   return withBookMutation(bookId, async () => {
     if (stopping) throw new Error("后台正在关闭，请重新启动后再操作");
     const data = await readLibrary(); const book = data.books.find((i) => i.id === bookId); if (!book) throw new Error("作品不存在");
-    const duplicate = (book.tasks || []).find((i) => ["queued", "running", "paused"].includes(i.status) && i.type === type && i.requestKey === detail);
+    const requestKey = metadata.requestKey || detail;
+    const duplicate = (book.tasks || []).find((i) => ["queued", "running", "paused"].includes(i.status) && i.type === type && i.requestKey === requestKey);
     if (duplicate) return duplicate;
-    const task = { id: `task-${Date.now()}-${Math.random().toString(16).slice(2, 7)}`, type, status: "queued", progress: 0, detail, requestKey: detail, createdAt: new Date().toISOString(), ...metadata };
+    const task = { id: `task-${Date.now()}-${Math.random().toString(16).slice(2, 7)}`, type, status: "queued", progress: 0, detail, requestKey, createdAt: new Date().toISOString(), ...metadata, requestKey };
     book.tasks ||= []; book.tasks.unshift(task); await saveLibrary(data);
     const controller = new AbortController();
     const control = { paused: false, cancelled: false, started: false, controller, signal: controller.signal }; taskControls.set(task.id, control);
     // Leave the mutation context before executing long-running model work.
     taskQueue = taskQueue.catch(() => {}).then(() => mutationContext.run(false, async () => {
       try {
-        await waitControl(control); control.started = true; await updateTask(task.id, { status: "running" }); console.log(`任务开始：${type}`);
-        await runner(task, control); checkControl(control); await updateTask(task.id, { status: "completed", progress: 100 }); console.log(`任务完成：${type}`);
-      } catch (error) { await updateTask(task.id, { status: control.cancelled ? "cancelled" : "failed", error: error.message, errorCode: error.code, detail: `${detail} · ${error.message}` }); console.log(`任务${control.cancelled ? "已停止" : "未完成"}：${type}`); }
+        await waitControl(control); control.started = true; await updateTask(task.id, { status: "running", startedAt: new Date().toISOString() }); console.log(`任务开始：${type}`);
+        await runner(task, control); checkControl(control); await updateTask(task.id, { status: "completed", progress: 100, finishedAt: new Date().toISOString() }); finishLive(task.id, "completed"); console.log(`任务完成：${type}`);
+      } catch (error) {
+        // Record what went wrong in full: message, code, and what the service or CLI actually returned.
+        finishLive(task.id, control.cancelled ? "cancelled" : "failed");
+        await updateTask(task.id, { status: control.cancelled ? "cancelled" : "failed", error: error.message, errorCode: error.code, errorDetail: taskErrorDetail(error), finishedAt: new Date().toISOString(), detail: `${detail} · ${error.message}` });
+        console.log(`任务${control.cancelled ? "已停止" : "未完成"}：${type}`);
+      }
       finally { taskControls.delete(task.id); }
     }));
     return task;
@@ -364,13 +478,39 @@ function selectSourceRange(source, range = { type: "whole" }) {
   }
   throw new Error("不支持的翻译范围");
 }
-async function translateBookChapter(bookId, chapterId, mode, range, retry = false) {
+// Translation prompt sets: the reader's own templates, a default, and which engine profile uses which.
+async function readPrompts() {
+  try { const state = JSON.parse(await readFile(PROMPTS_FILE, "utf8")); return { sets: Array.isArray(state.sets) ? state.sets : [], defaultId: state.defaultId || "builtin", bindings: state.bindings && typeof state.bindings === "object" ? state.bindings : {} }; }
+  catch { return { sets: [], defaultId: "builtin", bindings: {} }; }
+}
+async function savePrompts(body) {
+  const seen = new Set();
+  const sets = (Array.isArray(body.sets) ? body.sets : []).slice(0, 50).map((set) => { const clean = normalizePromptSet(set); if (seen.has(clean.id)) throw new Error("提示词编号重复"); seen.add(clean.id); return clean; });
+  const known = (id) => id === "builtin" || seen.has(id);
+  const profiles = new Set((await readProfiles()).map((p) => p.id));
+  const bindings = Object.fromEntries(Object.entries(body.bindings && typeof body.bindings === "object" ? body.bindings : {}).filter(([profile, id]) => profiles.has(profile) && known(id)));
+  const state = { sets, defaultId: known(body.defaultId) ? body.defaultId : "builtin", bindings, updatedAt: new Date().toISOString() };
+  await mkdir(DATA, { recursive: true }); const temp = `${PROMPTS_FILE}.tmp`;
+  await writeFile(temp, `${JSON.stringify(state, null, 2)}\n`, "utf8"); await rename(temp, PROMPTS_FILE);
+  return state;
+}
+async function promptsView() { return { ...(await readPrompts()), builtin: BUILTIN_PROMPT_SET, variables: PROMPT_VARIABLES, profiles: (await listProfiles()).profiles }; }
+async function promptSetForProvider(provider, profile) {
+  const id = profile?.id || (await readProfiles()).find((p) => engineKey(p.stored || {}) === engineKey(provider))?.id;
+  return promptSetFor(await readPrompts(), id);
+}
+
+async function translateBookChapter(bookId, chapterId, mode, range, retry = false, profileId = "") {
   const rangeLabel = range?.type === "paragraphs" ? `第 ${range.start}–${range.end} 段` : range?.type === "pages" ? `PDF 第 ${range.start}–${range.end} 页` : "整章";
   // Freeze configuration when queued; never persist API keys in task or block metadata.
-  const provider = await readProvider();
+  const { provider, profile } = await providerForTranslation(profileId);
   if (provider.backend && provider.backend !== "http") validateCliChoice(provider, provider.reasoningEffort ? await discoverProviderModels(provider) : null);
-  const engine = providerSnapshot(provider);
-  return startTask(bookId, mode === "refine" ? "译文精校" : "章节翻译", `${chapterId} · ${rangeLabel}`, async (task, control) => {
+  // The prompt set is frozen with the engine when queued, like every other setting.
+  const promptSet = await promptSetForProvider(provider, profile);
+  const engine = { ...providerSnapshot(provider), ...(profile ? { profileId: profile.id, profileName: profile.name, profileColor: profile.color } : {}), promptSetId: promptSet.id, promptSetName: promptSet.name };
+  const detail = `${chapterId} · ${rangeLabel}${profileId && profile ? ` · ${profile.name}` : ""}`;
+  // Different engines on the same chapter are separate requests; only an identical engine is a duplicate.
+  return startTask(bookId, mode === "refine" ? "译文精校" : "章节翻译", detail, async (task, control) => {
     let data = await readLibrary(); let book = data.books.find((i) => i.id === bookId); let chapter = book?.chapters.find((i) => i.id === chapterId); if (!chapter) throw new Error("章节不存在");
     const root = bookRoot(book); const fullSource = await readChapterText(root, chapter, "source"); if (!fullSource.trim()) throw new Error("本章没有可翻译原文");
     const selected = selectSourceRange(fullSource, range);
@@ -403,7 +543,7 @@ async function translateBookChapter(bookId, chapterId, mode, range, retry = fals
     });
     let result;
     try {
-      result = await translateChapter({ provider, book, chapter, source: selected.source, paragraphs, existingDraft, mode, previousTail: previousText.slice(-1200), glossary: book.glossary || [], characters: book.characters || [], control, resumeBlocks: run.blocks,
+      result = await translateChapter({ provider, book, chapter, source: selected.source, paragraphs, existingDraft, mode, previousTail: previousText.slice(-1200), glossary: book.glossary || [], characters: book.characters || [], promptSet, onLive: (update) => recordLive(task.id, update), control, resumeBlocks: run.blocks,
         onProgress: (progress, detail) => updateTask(task.id, { progress, detail: `${chapter.title} · ${detail}` }),
         onBlock: (block) => withBookMutation(bookId, async () => {
           checkControl(control);
@@ -418,7 +558,7 @@ async function translateBookChapter(bookId, chapterId, mode, range, retry = fals
         checkControl(control);
         const protectedRevision = (chapter.activeRevisionId || chapter.revisionId || null) !== startingRevisionId || chapter.draftOrigin === "reader" || chapter.status === "approved" || chapter.exportedAt;
         if (selected.partial) {
-          chapter.segments ||= []; chapter.segments.unshift({ id: `segment-${revisionId}`, label: selected.label, range: selected.range, sourceParagraphIds: paragraphs.map((p) => p.id), segments: result.segments, source: selected.source, translationPath: outputPath, status: "review", createdAt: new Date().toISOString() });
+          chapter.segments ||= []; chapter.segments.unshift({ id: `segment-${revisionId}`, label: selected.label, range: selected.range, sourceParagraphIds: paragraphs.map((p) => p.id), segments: result.segments, engine, source: selected.source, translationPath: outputPath, status: "review", createdAt: new Date().toISOString() });
         } else {
           chapter.revisionHistory.push({ id: revisionId, path: outputPath, origin: "ai", segments: result.segments, engine, blockEngines: result.blocks.map((b) => ({ id: b.id, sourceParagraphIds: b.sourceParagraphIds, engine: b.engine })), createdAt: new Date().toISOString(), reason: protectedRevision ? "新译稿已保留，读者版本未覆盖；可在历史中采用" : mode === "refine" ? "AI 精校" : "AI 初译" });
           if (!protectedRevision) {
@@ -457,7 +597,7 @@ async function translateBookChapter(bookId, chapterId, mode, range, retry = fals
         await withBookMutation(bookId, async () => { const latest = await readLibrary(); const current = latest.books.find((b) => b.id === bookId)?.chapters.find((c) => c.id === chapterId); if (current) { current.analysisError = `译文已保存，注释分析未完成：${error.message}`; await saveLibrary(latest); } });
       }
     }
-  }, { chapterId, mode, range: range || { type: "whole" }, engine });
+  }, { chapterId, mode, range: range || { type: "whole" }, engine, requestKey: `${chapterId} · ${rangeLabel} · ${engineKey(engine)}` });
 }
 async function storeChapterAnalysis(bookId, chapterId, result, model) {
   return withBookMutation(bookId, async () => {
@@ -486,7 +626,7 @@ async function maybeAutoReviseChapter({ bookId, chapterId, source, provider, ris
   const existingDraft = await readChapterText(bookRoot(book), chapter, "current");
   let revised;
   try {
-    revised = await translateChapter({ provider, book, chapter, source, existingDraft, mode: "refine", correction: { originalTerm: risk.originalTerm, currentChinese: risk.proposed, suggestedChinese: research.suggestedChinese, evidence: research.sources.map((entry) => `${entry.title || entry.url}：${entry.excerpt}`).join("；").slice(0, 1500) }, control });
+    revised = await translateChapter({ provider, book, chapter, source, existingDraft, mode: "refine", promptSet: await promptSetForProvider(provider), correction: { originalTerm: risk.originalTerm, currentChinese: risk.proposed, suggestedChinese: research.suggestedChinese, evidence: research.sources.map((entry) => `${entry.title || entry.url}：${entry.excerpt}`).join("；").slice(0, 1500) }, control });
   } catch { return false; }
   if (!revised.text.includes(research.suggestedChinese) || revised.text.includes(risk.proposed)) return false;
   return withBookMutation(bookId, async () => {
@@ -567,12 +707,33 @@ async function api(req, res, url) {
   }
   if (req.method === "GET" && url.pathname === "/api/provider") return json(res, 200, publicProvider(await readProvider()));
   if (req.method === "PUT" && url.pathname === "/api/provider") return json(res, 200, await saveProvider(await readJson(req)));
-  if (req.method === "POST" && url.pathname === "/api/provider/models") { const provider = await providerForRequest(await readJson(req)); return json(res, 200, await discoverProviderModels(provider, true)); }
+  if (req.method === "GET" && url.pathname === "/api/engine-profiles") return json(res, 200, await listProfiles());
+  if (req.method === "GET" && url.pathname === "/api/prompts") return json(res, 200, await promptsView());
+  if (req.method === "PUT" && url.pathname === "/api/prompts") { try { await savePrompts(await readJson(req)); } catch (error) { return json(res, 400, { error: error.message }); } return json(res, 200, await promptsView()); }
+  if (req.method === "POST" && url.pathname === "/api/prompts/preview") {
+    // What the first block of a real chapter would send with a (possibly unsaved) set.
+    const body = await readJson(req); const data = await readLibrary();
+    const book = data.books.find((b) => b.id === body.bookId); const chapter = book?.chapters.find((c) => c.id === body.chapterId);
+    if (!chapter) return json(res, 404, { error: "请选择一个已整理的章节" });
+    let set; try { set = body.set?.builtin || !body.set ? BUILTIN_PROMPT_SET : normalizePromptSet(body.set); } catch (error) { return json(res, 400, { error: error.message }); }
+    const { provider } = await providerForTranslation(typeof body.profileId === "string" ? body.profileId : "");
+    const source = await readChapterText(bookRoot(book), chapter, "source");
+    const index = book.chapters.indexOf(chapter); const previous = index > 0 ? await readChapterText(bookRoot(book), book.chapters[index - 1], "current").catch(() => "") : "";
+    return json(res, 200, previewTranslationMessages({ provider, book, chapter, source, mode: body.mode === "refine" ? "refine" : "draft", promptSet: set, previousTail: String(previous || "").slice(-1200), existingDraft: await readChapterText(bookRoot(book), chapter, "current").catch(() => "") }));
+  }
+  if (req.method === "POST" && url.pathname === "/api/engine-profiles") return json(res, 200, await saveProfileFromCurrent(await readJson(req)));
+  const profileMatch = url.pathname.match(/^\/api\/engine-profiles\/([^/]+)(\/activate)?$/);
+  if (profileMatch && req.method === "POST" && profileMatch[2]) return json(res, 200, await activateProfile(profileMatch[1]));
+  if (profileMatch && req.method === "PATCH" && !profileMatch[2]) return json(res, 200, await updateProfile(profileMatch[1], await readJson(req)));
+  if (profileMatch && req.method === "DELETE" && !profileMatch[2]) return json(res, 200, await deleteProfile(profileMatch[1]));
+  if (req.method === "POST" && url.pathname === "/api/provider/models") {
+    const body = await readJson(req);
+    if (!body.backend || body.backend === "http") return json(res, 200, await listHttpModels(await candidateProvider(body)));
+    const provider = await providerForRequest(body); return json(res, 200, await discoverProviderModels(provider, true));
+  }
   if (req.method === "POST" && url.pathname === "/api/provider/probe") { const provider = await providerForRequest(await readJson(req)); return json(res, 200, usesOpenCodeServer(provider) ? await probeOpenCodeServer(provider) : await probeCli(provider.backend, provider.cliPath)); }
   if (req.method === "POST" && url.pathname === "/api/provider/test") {
-    const body = await readJson(req); const previous = await readProvider();
-    const sameOrigin = !body.baseUrl || new URL(body.baseUrl).origin === new URL(previous.baseUrl).origin;
-    const candidate = { ...previous, ...body, ...openCodeSettings(body, previous), apiKey: body.clearKey ? "" : body.apiKey || (sameOrigin ? previous.apiKey : "") };
+    const body = await readJson(req); const candidate = await candidateProvider(body);
     if (candidate.backend && candidate.backend !== "http") validateCliChoice(candidate, candidate.reasoningEffort ? await discoverProviderModels(candidate) : null);
     const result = await testProviderConnection(candidate);
     if (body.save) await saveProvider(body);
@@ -679,18 +840,85 @@ async function api(req, res, url) {
     if (selected.path.replaceAll("\\", "/").includes("/polished/")) chapter.polishedPath = selected.path;
     else { chapter.translationPath = selected.path; chapter.polishedPath = ""; }
     chapter.draftOrigin = "reader"; chapter.exportedAt = null; chapter.status = "review"; chapter.revisionId = newRevisionId(); chapter.activeRevisionId = chapter.revisionId; chapter.updatedAt = new Date().toISOString();
-    chapter.revisionHistory.push({ id: chapter.revisionId, path: selected.path, segments: selected.segments || null, origin: "reader", createdAt: chapter.updatedAt, reason: `读者恢复版本 ${selected.id}` });
+    chapter.revisionHistory.push({ id: chapter.revisionId, path: selected.path, segments: selected.segments || null, ...(selected.engine ? { engine: selected.engine } : {}), ...(selected.segmentSources ? { segmentSources: selected.segmentSources } : {}), origin: "reader", createdAt: chapter.updatedAt, reason: `读者恢复版本 ${selected.id}` });
     await saveLibrary(data); await syncProjectState(book); return json(res, 200, chapter);
   });
+  // Illustrations: which images a chapter has, and the image files themselves (only ones listed in the index).
+  const imagesMatch = url.pathname.match(/^\/api\/books\/([^/]+)\/(chapters\/([^/]+)\/images|images\/file)$/);
+  if (imagesMatch && req.method === "GET") {
+    const data = await readLibrary(); const book = data.books.find((b) => b.id === imagesMatch[1]); if (!book) return json(res, 404, { error: "作品不存在" });
+    const index = await bookImages({ book, bookRoot: bookRoot(book) });
+    const fileUrl = (path) => `/api/books/${encodeURIComponent(book.id)}/images/file?path=${encodeURIComponent(path)}`;
+    if (imagesMatch[3]) {
+      const chapter = book.chapters.find((c) => c.id === imagesMatch[3]); if (!chapter) return json(res, 404, { error: "章节不存在" });
+      const href = String(chapter.sourceHref || "").replace(/\\/g, "/");
+      return json(res, 200, { images: (index.chapters?.[href] || []).map((image) => ({ url: fileUrl(image.path), alt: image.alt || "" })), cover: index.cover ? fileUrl(index.cover) : null });
+    }
+    const wanted = url.searchParams.get("path") || "";
+    const known = new Set([index.cover, ...Object.values(index.chapters || {}).flat().map((i) => i.path)].filter(Boolean));
+    if (!known.has(wanted)) return json(res, 404, { error: "图片不存在" });
+    const file = join(bookImagesDir(bookRoot(book)), "files", ...wanted.split("/"));
+    const types = { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml", ".bmp": "image/bmp", ".avif": "image/avif" };
+    if (!existsSync(file)) return json(res, 404, { error: "图片不存在" });
+    // Book content is untrusted: never let an SVG run script if opened directly.
+    res.writeHead(200, { "content-type": types[extname(file).toLowerCase()] || "application/octet-stream", "cache-control": "private, max-age=86400", "x-content-type-options": "nosniff", "content-security-policy": "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox" });
+    return createReadStream(file).pipe(res);
+  }
+  const alignMatch = url.pathname.match(/^\/api\/books\/([^/]+)\/chapters\/([^/]+)\/align$/);
+  if (alignMatch && req.method === "POST") {
+    const body = await readJson(req); const data = await readLibrary(); const book = data.books.find((b) => b.id === alignMatch[1]);
+    if (!book?.chapters.some((c) => c.id === alignMatch[2])) return json(res, 404, { error: "章节不存在" });
+    const text = (value, max) => typeof value === "string" && value.trim() && value.length <= max ? value : null;
+    const selection = text(body.selection, 300), sourceText = text(body.sourceText, 12000), translationText = text(body.translationText, 12000);
+    if (!["source", "translation"].includes(body.side) || !selection || !sourceText || !translationText) return json(res, 400, { error: "请选中一段不超过 300 字的文字" });
+    const { provider, profile } = await providerForTranslation(body.profileId);
+    const result = await alignSelection({ provider, book, side: body.side, selection: selection.trim(), sourceText, translationText });
+    return json(res, 200, { ...result, engine: profile?.name || provider.providerName || provider.backend || "" });
+  }
+  const composeMatch = url.pathname.match(/^\/api\/books\/([^/]+)\/chapters\/([^/]+)\/compose(-draft)?$/);
+  if (composeMatch && req.method === "PUT" && composeMatch[3]) return withBookMutation(composeMatch[1], async () => {
+    // Unfinished picks survive reloads; they are hints only and are re-validated when composing.
+    const body = await readJson(req); const data = await readLibrary(); const book = data.books.find((b) => b.id === composeMatch[1]); const chapter = book?.chapters.find((c) => c.id === composeMatch[2]);
+    if (!chapter) return json(res, 404, { error: "章节不存在" });
+    const clean = (value, max) => Object.fromEntries(Object.entries(value && typeof value === "object" ? value : {}).filter(([k, v]) => typeof k === "string" && k.length < 4000 && typeof v === "string" && v.length <= max).slice(0, 5000));
+    chapter.composeDraft = { picks: clean(body.picks, 200), custom: clean(body.custom, 20000), updatedAt: new Date().toISOString() };
+    await saveLibrary(data); return json(res, 200, chapter.composeDraft);
+  });
+  if (composeMatch && req.method === "POST" && !composeMatch[3]) return withBookMutation(composeMatch[1], async () => {
+    const body = await readJson(req); const data = await readLibrary(); const book = data.books.find((b) => b.id === composeMatch[1]); const chapter = book?.chapters.find((c) => c.id === composeMatch[2]);
+    if (!chapter) return json(res, 404, { error: "章节不存在" });
+    if (book.demo) return json(res, 409, { error: "演示作品不支持合成译稿" });
+    const root = bookRoot(book); const ids = sourceParagraphs(await readChapterText(root, chapter, "source"), chapter.id).map((p) => p.id);
+    const profiles = (await listProfiles()).profiles;
+    const versions = [...comparableVersions(chapter, ids, profiles), ...partialVersions(chapter, ids, profiles)];
+    const composed = composeRevision(ids, versions, body.choices);
+    await preserveExistingRevision(root, chapter);
+    const revisionId = newRevisionId(); const path = await writeTranslation(root, chapter, composed.text, false, `mix-${revisionId}`);
+    chapter.translationPath = path; chapter.polishedPath = ""; chapter.revisionId = revisionId; chapter.activeRevisionId = revisionId;
+    // A composed text is the reader's decision: later AI runs are kept in history instead of replacing it.
+    chapter.draftOrigin = "reader"; chapter.status = "review"; chapter.exportedAt = null; chapter.updatedAt = new Date().toISOString();
+    chapter.revisionHistory ||= [];
+    chapter.revisionHistory.push({ id: revisionId, path, origin: "mix", segments: composed.segments, segmentSources: composed.segmentSources, createdAt: chapter.updatedAt, reason: typeof body.note === "string" && body.note.trim() ? `读者替换：${body.note.trim().slice(0, 80)}` : `多译本合成：${composed.summary}` });
+    delete chapter.composeDraft;
+    await saveLibrary(data); await syncProjectState(book); return json(res, 200, { revisionId, summary: composed.summary });
+  });
   const translateMatch = url.pathname.match(/^\/api\/books\/([^/]+)\/chapters\/([^/]+)\/translate$/);
-  if (req.method === "POST" && translateMatch) { const body = await readJson(req); return json(res, 202, await translateBookChapter(translateMatch[1], translateMatch[2], body.mode === "refine" ? "refine" : "draft", body.range || { type: "whole" }, Boolean(body.retry))); }
+  if (req.method === "POST" && translateMatch) { const body = await readJson(req); return json(res, 202, await translateBookChapter(translateMatch[1], translateMatch[2], body.mode === "refine" ? "refine" : "draft", body.range || { type: "whole" }, Boolean(body.retry), typeof body.profileId === "string" ? body.profileId : "")); }
   const analyzeMatch = url.pathname.match(/^\/api\/books\/([^/]+)\/chapters\/([^/]+)\/analyze$/);
   if (req.method === "POST" && analyzeMatch) return json(res, 202, await analyzeBookChapter(analyzeMatch[1], analyzeMatch[2]));
   const segmentMatch = url.pathname.match(/^\/api\/books\/([^/]+)\/chapters\/([^/]+)\/segments\/([^/]+)$/);
   if (req.method === "PATCH" && segmentMatch) {
     const body = await readJson(req); const data = await readLibrary(); const book = data.books.find((item) => item.id === segmentMatch[1]); const chapter = book?.chapters.find((item) => item.id === segmentMatch[2]); const segment = chapter?.segments?.find((item) => item.id === segmentMatch[3]);
     if (!segment) return json(res, 404, { error: "节选译文不存在" });
-    if (body.translation !== undefined) await writeFile(join(bookRoot(book), segment.translationPath), `${String(body.translation).trim()}\n`, "utf8");
+    if (body.translation !== undefined) {
+      await writeFile(join(bookRoot(book), segment.translationPath), `${String(body.translation).trim()}\n`, "utf8");
+      // Keep the aligned copy honest: same paragraph count updates it, anything else retires it from comparison.
+      if (Array.isArray(segment.segments)) {
+        const parts = String(body.translation).trim().split(/\n\s*\n/).map((t) => t.trim()).filter(Boolean);
+        if (parts.length === segment.segments.length) { segment.segments = segment.segments.map((s, i) => ({ ...s, text: parts[i] })); delete segment.alignedStale; }
+        else segment.alignedStale = true;
+      }
+    }
     if (["review", "approved"].includes(body.status)) segment.status = body.status;
     segment.updatedAt = new Date().toISOString(); await saveLibrary(data); return json(res, 200, segment);
   }
@@ -708,6 +936,8 @@ async function api(req, res, url) {
     if (book.scopes.length === before) return json(res, 404, { error: "选集不存在" });
     await saveLibrary(data); return json(res, 200, { ok: true });
   }
+  const liveMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/live$/);
+  if (req.method === "GET" && liveMatch) { const live = liveOutput.get(liveMatch[1]); return json(res, 200, live ? { ...live, now: Date.now() } : { taskId: liveMatch[1], phase: "none", now: Date.now() }); }
   const taskMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/(pause|resume|cancel)$/);
   if (req.method === "POST" && taskMatch) {
     const control = taskControls.get(taskMatch[1]); if (!control) return json(res, 409, { error: "任务当前不在运行；应用重启后的任务请重新发起" });
@@ -818,10 +1048,32 @@ async function api(req, res, url) {
         hydrated.push({ ...segment, id: segment.id, title: `${chapter.title} · ${segment.label}`, translation, status: "approved" });
       }
     } else for (const chapter of book.chapters) if (!body.chapterIds?.length || body.chapterIds.includes(chapter.id)) hydrated.push({ ...chapter, source: await readChapterText(bookRoot(book), chapter, "source"), translation: await readChapterText(bookRoot(book), chapter, "current") });
+    // Illustrations from the original EPUB: placeholders become images, and picture-only pages within the
+    // exported range come along even though nobody translates them.
+    let pictures = null;
+    if (!body.selectionOnly && ["EPUB", "AZW3"].includes(String(book.format).toUpperCase())) {
+      const index = await bookImages({ book, bookRoot: bookRoot(book) }).catch(() => null);
+      if (index && (Object.keys(index.chapters || {}).length || index.cover)) {
+        const imagesOf = (c) => index.chapters?.[String(c.sourceHref || "").replace(/\\/g, "/")] || [];
+        const order = book.chapters.map((c) => c.id);
+        const kept = hydrated.filter((c) => c.status === "approved" || (body.includeDraft && c.translation?.trim())).map((c) => order.indexOf(c.id)).filter((i) => i >= 0);
+        if (kept.length) {
+          const lo = body.chapterIds?.length ? Math.min(...kept) : 0, hi = body.chapterIds?.length ? Math.max(...kept) : order.length - 1;
+          for (let i = lo; i <= hi; i++) {
+            const chapter = book.chapters[i]; if (!imagesOf(chapter).length || kept.includes(i)) continue;
+            const source = await readChapterText(bookRoot(book), chapter, "source"); if (!isIllustrationText(source)) continue;
+            const entry = { ...chapter, source, translation: source, status: "approved", illustration: true };
+            const at = hydrated.findIndex((h) => h.id === chapter.id); if (at >= 0) hydrated[at] = entry; else hydrated.push(entry);
+          }
+          hydrated.sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
+        }
+        pictures = { dir: join(bookImagesDir(bookRoot(book)), "files"), cover: index.cover, chapter: imagesOf };
+      }
+    }
     const selectionSuffix = body.selectionOnly ? "selections" : body.chapterIds?.length ? "selected" : (body.includeDraft ? "draft" : "approved");
     const exportId = `export-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`;
     const filename = `xiaoxiangguan-${selectionSuffix}-${exportId}.epub`; const outputPath = join(EXPORTS, filename);
-    const result = await createEpub({ book, chapters: hydrated, outputPath, includeDraft: Boolean(body.includeDraft) });
+    const result = await createEpub({ book, chapters: hydrated, outputPath, includeDraft: Boolean(body.includeDraft), pictures });
     const included = new Set(result.chapterIds);
     if (!body.selectionOnly) for (const chapter of book.chapters) if (included.has(chapter.id)) chapter.exportedAt = new Date().toISOString();
     data.exports.unshift({ id: exportId, bookId: book.id, bookTitle: book.title, filename, chapterCount: result.chapterCount, createdAt: new Date().toISOString(), includesDraft: Boolean(body.includeDraft) }); await saveLibrary(data);
@@ -851,7 +1103,8 @@ const server = http.createServer(async (req, res) => {
     const path = normalize(join(PUBLIC, requested));
     if (!path.startsWith(PUBLIC) || !existsSync(path)) { res.writeHead(404); return res.end("Not found"); }
     const info = await stat(path); if (!info.isFile()) { res.writeHead(404); return res.end("Not found"); }
-    res.writeHead(200, { "content-type": mime[extname(path)] || "application/octet-stream" }); createReadStream(path).pipe(res);
+    // Local app code must never be served stale after an update; fonts may be cached.
+    res.writeHead(200, { "content-type": mime[extname(path)] || "application/octet-stream", ...([".html", ".js", ".css"].includes(extname(path)) ? { "cache-control": "no-cache" } : {}) }); createReadStream(path).pipe(res);
   } catch (error) { console.error(error); json(res, 500, { error: error.message || "服务器错误" }); }
 });
 
